@@ -205,18 +205,31 @@ def generer_programme(data):
     if len(exercices) < nombre_exercices:
         return {"error": "Pas assez d'exercices compatibles avec le niveau et le matériel"}
 
+    MOTS_CLES_CARDIO = ["Course / sprint","Mountain climbers","Stepper","Sauts corde","Air bike","Rameur","Elliptique","Frappe","Marche sur place","Mountain climbers","Jumping jacks","Burpees","Jump squats","Fentes sautées","High knees"]
+
+    # Force a avoir au moins 1 exercice cardio pour la perte de poids
+    if objectif == "perte_de_poids":
+        exercices_cardio = [
+            ex for ex in exercices
+            if any(mot in ex["nom"].lower() for mot in MOTS_CLES_CARDIO)
+        ]
+
+        if exercices_cardio:
+            cardio = exercices_cardio[0]
+
+            if cardio not in exercices:
+                exercices.pop()
+                exercices.insert(0, cardio)
 
     contexte = construire_contexte(exercices)
 
     prompt = f"""
 {contexte}
 
-Tu es une IA experte en sport.
+Tu es une IA experte en recommandation de sport.
 
-Objectif utilisateur : {objectif}
+Objectif : {objectif}
 Niveau : {niveau}
-
-Créer un programme d'entraînement cohérent.
 
 Réponds UNIQUEMENT avec ce JSON strict :
 
@@ -224,30 +237,40 @@ Réponds UNIQUEMENT avec ce JSON strict :
   "niveau": "{niveau}",
   "objectif": "{objectif}",
   "programme": [
-      {{
-        "exercice": "",
-        "series": 0,
-        "repetitions": 0,
-        "temps_de_repos": 0
-      }}
+    {{
+      "exercice": "Nom de l'exercice (Muscle)",
+      "series": 0,
+      "repetitions": 0,
+      "temps_de_repos": 0
+    }}
   ],
   "progression": {{
     "semaine": [1, 2, 3, 4]
   }}
 }}
 
-RÈGLES OBLIGATOIRES :
-- Utilise uniquement les exercices listés
-- programme contient EXACTEMENT {nombre_exercices} exercices
-- Aucun texte hors JSON
-- S'il n'y a pas assez d'exercices disponibles, tu DOIS quand même en générer {nombre_exercices}
-  en réutilisant uniquement ceux fournis
-- Tu n'as PAS le droit de modifier la structure du JSON, ni d'ajouter des champs, ni de faire du texte libre
+RÈGLES STRICTES :
+- Strict JSON uniquement, aucun texte ou commentaire
+- programme contient EXACTEMENT {nombre_exercices} objets
+- Utilise exclusivement les exercices listés
+- Le champ "exercice" DOIT être au format exact :
+  "Nom de l'exercice (Muscle)"
+- Ne pas modifier la structure du JSON
+
+OBJECTIF :
+
+- perte_de_poids → reps 12-20, repos 30-60 s, cardio / full body
+- prise_de_masse → reps 6-12, repos 90-180 s, force
+
+ÉQUILIBRAGE MUSCULAIRE :
+- Les exercices doivent être répartis sur des groupes musculaires différents
+
 """
+
 
     response = model(
         prompt,
-        max_new_tokens=800,
+        max_new_tokens=400,
         temperature=0.2,   # paramètres de créativité = plus de respect des règles
         top_p=0.9,       # contrôle la diversité des mots que l’IA peut choisir plus bas = plus rigide sans créativité
         repetition_penalty=1.1    # pénalité pour éviter les répétitions dans la génération
@@ -263,7 +286,7 @@ if __name__ == "__main__":
     requete_test = {
         "niveau": "intensif",
         "objectif": "perte_de_poids",
-        "materiels": ["kettlebells", "haltères"]
+        "materiels": ["Banc d'entraînement","Haltères"]
     }
 
     resultat = generer_programme(requete_test)
