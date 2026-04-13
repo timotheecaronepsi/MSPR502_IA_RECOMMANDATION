@@ -205,7 +205,7 @@ def generer_programme(data):
     if len(exercices) < nombre_exercices:
         return {"error": "Pas assez d'exercices compatibles avec le niveau et le matériel"}
 
-    MOTS_CLES_CARDIO = ["Course / sprint","Mountain climbers","Stepper","Sauts corde","Air bike","Rameur","Elliptique","Frappe","Marche sur place","Mountain climbers","Jumping jacks","Burpees","Jump squats","Fentes sautées","High knees"]
+    MOTS_CLES_CARDIO = ["Course / sprint","Mountain climbers","Stepper","Sauts corde","Air bike","Rameur","Elliptique","Frappe","Marche sur place","Jumping jacks","Burpees","Jump squats","Fentes sautées","High knees"]
 
     # Force a avoir au moins 1 exercice cardio pour la perte de poids
     if objectif == "perte_de_poids":
@@ -223,26 +223,20 @@ def generer_programme(data):
 
     contexte = construire_contexte(exercices)
 
-    prompt = f"""
-{contexte}
+    prompt = f"""{contexte}
 
 Tu es une IA experte en recommandation de sport.
 
 Objectif : {objectif}
 Niveau : {niveau}
 
-Réponds UNIQUEMENT avec ce JSON strict :
+Réponds UNIQUEMENT avec un JSON sous cette forme :
 
 {{
   "niveau": "{niveau}",
   "objectif": "{objectif}",
   "programme": [
-    {{
-      "exercice": "Nom de l'exercice (Muscle)",
-      "series": 0,
-      "repetitions": 0,
-      "temps_de_repos": 0
-    }}
+    {{"exercice": "Nom (Muscle)", "series": 0, "repetitions": 0, "temps_de_repos": 0}}
   ],
   "progression": {{
     "semaine": [1, 2, 3, 4]
@@ -251,10 +245,8 @@ Réponds UNIQUEMENT avec ce JSON strict :
 
 RÈGLES STRICTES :
 - Strict JSON uniquement, aucun texte ou commentaire
-- programme contient EXACTEMENT {nombre_exercices} objets
+- programme contient EXACTEMENT {nombre_exercices} exercices
 - Utilise exclusivement les exercices listés
-- Le champ "exercice" DOIT être au format exact :
-  "Nom de l'exercice (Muscle)"
 - Ne pas modifier la structure du JSON
 
 OBJECTIF :
@@ -266,7 +258,6 @@ OBJECTIF :
 - Les exercices doivent être répartis sur des groupes musculaires différents
 
 """
-
 
     response = model(
         prompt,
@@ -286,7 +277,7 @@ if __name__ == "__main__":
     requete_test = {
         "niveau": "intensif",
         "objectif": "perte_de_poids",
-        "materiels": ["Banc d'entraînement","Haltères"]
+        "materiels": ["Banc d'entraînement","Haltères","Barres"]
     }
 
     resultat = generer_programme(requete_test)
