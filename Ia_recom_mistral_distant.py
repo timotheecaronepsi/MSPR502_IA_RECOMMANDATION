@@ -2,6 +2,7 @@ import json
 import re # re pour Regex
 import os
 import time
+from datetime import datetime
 import urllib.request
 import urllib.error
 
@@ -41,7 +42,7 @@ HF_TIMEOUT_SEC = float(os.getenv("HF_TIMEOUT_SEC", "12"))
 # Nombre de tentatives par modele avant de passer au suivant.
 HF_MAX_RETRIES = int(os.getenv("HF_MAX_RETRIES", "2"))
 # Budget max de generation pour eviter la troncature du JSON.
-HF_MAX_TOKENS = int(os.getenv("HF_MAX_TOKENS", "520"))
+HF_MAX_TOKENS = int(os.getenv("HF_MAX_TOKENS", "600"))
 # Fallbacks modeles: essayes dans l'ordre si le modele principal echoue.
 HF_MODEL_FALLBACKS = [
     HF_MODEL_ID,  # Modele provenant du .env: tente en premier.
@@ -170,6 +171,49 @@ OBJECTIFS_AUTORISES = {
     "prise_de_masse"
 }
 
+
+def calculer_nombre_semaines(date_debut, date_fin):
+    debut = datetime.fromisoformat(date_debut)
+    fin = datetime.fromisoformat(date_fin)
+
+    if fin < debut:
+        raise ValueError("date_fin doit être postérieure à date_debut")
+
+    diff_jours = (fin - debut).days
+    return max(1, (diff_jours + 6) // 7)
+
+
+def construire_objectifs_utilisateur(objectif, poids_actuel_kg, valeur_cible, unite, nombre_semaines):
+    # valeur_cible est le poids final cible en kg
+    valeur_cible = float(valeur_cible)
+    unite = unite.lower().strip()
+    
+    poids_cible_estime = round(valeur_cible, 2)
+    delta_total = poids_cible_estime - poids_actuel_kg
+
+    paliers = [0.25, 0.5, 0.75, 1.0]
+    objectifs = []
+
+    for index, palier in enumerate(paliers, start=1):
+        semaine = max(1, int(round(nombre_semaines * palier)))
+        poids_cible_hebdo = round(poids_actuel_kg + (delta_total * palier), 2)
+        objectifs.append(
+            {
+                "objectif": index,
+                "semaine": semaine,
+                "poids_cible_kg": poids_cible_hebdo,
+            }
+        )
+
+    return {
+        "type": objectif,
+        "poids_actuel_kg": poids_actuel_kg,
+        "valeur_cible": valeur_cible,
+        "unite": unite,
+        "poids_cible_estime_kg": poids_cible_estime,
+        "objectifs_intermediaires": objectifs,
+    }
+
 # ==============================
 ### CHEMIN BASE ET FONCTIONS LIRES FICHIERS
 # ==============================
@@ -274,8 +318,28 @@ def valider_requete(data):     # Verif des données d'entréé
     if "materiels" not in data:
         return False, "Les matériels sont obligatoires"
 
+    if "date_debut" not in data:
+        return False, "La date de début est obligatoire"
+
+    if "date_fin" not in data:
+        return False, "La date de fin est obligatoire"
+
+    if "valeur_cible" not in data:
+        return False, "La valeur cible est obligatoire"
+
+    if "unite" not in data:
+        return False, "L'unité est obligatoire"
+
+    biometrie = data.get("biometrie") or data.get("suivi_biometrique")
+    if not isinstance(biometrie, dict):
+        return False, "Les données biométriques sont obligatoires"
+
+    if "poids_kg" not in biometrie:
+        return False, "Le poids actuel (kg) est obligatoire"
+
     niveau = data["niveau"].lower().strip()
     objectif = data["objectif"].lower().strip()
+    unite = data["unite"].lower().strip()
 
     if niveau not in NIVEAUX_AUTORISES:
         return False, "Niveau invalide"
@@ -285,6 +349,29 @@ def valider_requete(data):     # Verif des données d'entréé
 
     if not isinstance(data["materiels"], list):
         return False, "Les matériels doivent être une liste"
+
+    if unite != "kg":
+        return False, "Unité invalide (doit être 'kg')"
+
+    try:
+        float(data["valeur_cible"])
+    except (TypeError, ValueError):
+        return False, "La valeur cible doit être numérique"
+
+    poids_actuel_kg = float(biometrie["poids_kg"])
+    valeur_cible = float(data["valeur_cible"])
+
+    if objectif == "prise_de_masse" and valeur_cible <= poids_actuel_kg:
+        return False, "Pour prise_de_masse, la valeur cible doit être supérieure au poids actuel"
+
+    if objectif == "perte_de_poids" and valeur_cible >= poids_actuel_kg:
+        return False, "Pour perte_de_poids, la valeur cible doit être inférieure au poids actuel"
+
+    try:
+        datetime.fromisoformat(data["date_debut"])
+        datetime.fromisoformat(data["date_fin"])
+    except ValueError:
+        return False, "Les dates doivent être au format ISO 8601"
 
     return True, None
 
@@ -302,6 +389,20 @@ def generer_programme(data):
     niveau = data["niveau"]
     objectif = data["objectif"]
     materiels_user = data["materiels"]
+    date_debut = data["date_debut"]
+    date_fin = data["date_fin"]
+    valeur_cible = float(data["valeur_cible"])
+    unite = data["unite"]
+    biometrie = data.get("biometrie") or data.get("suivi_biometrique") or {}
+    poids_actuel_kg = float(biometrie["poids_kg"])
+    nombre_semaines = calculer_nombre_semaines(date_debut, date_fin)
+    objectif_utilisateur = construire_objectifs_utilisateur(
+        objectif,
+        poids_actuel_kg,
+        valeur_cible,
+        unite,
+        nombre_semaines
+    )
 
     # Etape 2: chargement du catalogue d'exercices/materiels/liaisons.
     exercices = charger_exercices("exercices.txt")
@@ -373,13 +474,19 @@ def generer_programme(data):
     prompt = f"""{contexte}
 Tu es un coach fitness IA. Génère un programme JSON.
 Objectif: {objectif}, Niveau: {niveau}
+Durée totale: {nombre_semaines} semaines
+Poids actuel: {poids_actuel_kg} kg
+Objectif cible: {valeur_cible} {unite}
+Poids cible estimé: {objectif_utilisateur['poids_cible_estime_kg']} kg
+Objectifs intermédiaires:
+{json.dumps(objectif_utilisateur['objectifs_intermediaires'], ensure_ascii=False, indent=2)}
 EXACTEMENT {nombre_exercices} exercices de la liste.
 JSON STRICT:
 {{
 "niveau": "{niveau}",
 "objectif": "{objectif}",
 "programme": [{{"exercice": "Nom (Muscle)", "series": 0, "repetitions": 0, "temps_de_repos": 0}}],
-"progression": {{"semaine": [1, 2, 3, 4]}}
+"progression": {{"nombre_semaines": {nombre_semaines}}}
 }}
 Interdit: aucun autre champ, aucune planification par jour, aucune explication.
 """
@@ -412,6 +519,9 @@ Interdit: aucun autre champ, aucune planification par jour, aucune explication.
         METRICS["errors"] += 1
     else:
         METRICS["json_ok"] += 1
+        # Enleve les champs inutiles
+        parsed.pop("poids_actuel", None)
+        parsed.pop("poids_cible", None)
     return parsed
 
 # ==============================
@@ -422,8 +532,13 @@ if __name__ == "__main__":
     # Bloc de test manuel local pour valider rapidement la generation.
     requete_test = {
         "niveau": "intensif",
-        "objectif": "perte_de_poids",
-        "materiels": ["Banc d'entraînement","Haltères","Barres"]
+        "objectif": "prise_de_masse",
+        "date_debut": "2026-01-10T00:00:00",
+        "date_fin": "2026-03-20T00:00:00",
+        "valeur_cible": 125,
+        "unite": "kg",
+        "biometrie": {"poids_kg": 115},
+        "materiels": ["Banc d'entraînement","Haltères","Barres","Rameur","Stepper","Air bike","Corde à sauter"]
     }
 
     # Affiche resultat metier + metriques runtime.
