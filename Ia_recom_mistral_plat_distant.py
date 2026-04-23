@@ -1,6 +1,7 @@
 import json
 import os
 import time
+import unicodedata
 import urllib.error
 import urllib.request
 
@@ -171,9 +172,235 @@ OBJECTIFS_ALIMENTAIRES_AUTORISES = {
 	"prise_de_masse"
 }
 
+ALLOWED_MEAL_TYPES = ["dejeuner", "diner", "souper"]
+
 BUDGETS_AUTORISES = {"economique", "standard", "premium"}
 BUDGET_LEVEL_TO_LABEL = {1: "economique", 2: "standard", 3: "premium"}
 BUDGET_LABEL_TO_LEVEL = {v: k for k, v in BUDGET_LEVEL_TO_LABEL.items()}
+
+RESTRICTIONS_EQ_FILE = os.path.join(BASE_DIR, "restrictions_equivalences.json")
+
+
+def normalize_text(value):
+	"""Normalise un texte pour comparaisons robustes (accents/casse/espaces)."""
+	text = str(value or "").strip().lower()
+	text = unicodedata.normalize("NFKD", text)
+	text = "".join(ch for ch in text if not unicodedata.combining(ch))
+	return " ".join(text.split())
+
+
+def load_restriction_equivalences(path):
+	"""Charge les equivalences de restrictions depuis un JSON externe."""
+	fallback = {
+		"arachides": ["arachides", "arachide", "peanut", "peanuts"],
+		"porc": ["porc", "pork", "ham", "bacon"],
+		"poulet": ["poulet", "chicken"],
+		"riz": ["riz", "rice"],
+		"brocoli": ["brocoli", "broccoli"],
+		"pain": ["pain", "bread", "white bread"],
+	}
+
+	if not os.path.exists(path):
+		return fallback
+
+	try:
+		with open(path, "r", encoding="utf-8") as f:
+			data = json.load(f)
+		if not isinstance(data, dict):
+			return fallback
+
+		normalized = {}
+		for key, values in data.items():
+			nk = normalize_text(key)
+			if not nk:
+				continue
+			if isinstance(values, list):
+				normalized[nk] = [normalize_text(v) for v in values if normalize_text(v)]
+
+		return normalized or fallback
+	except Exception:
+		return fallback
+
+
+RESTRICTION_EQUIVALENCES = load_restriction_equivalences(RESTRICTIONS_EQ_FILE)
+
+
+def build_restriction_alias_index(equivalences):
+	"""Construit un index inverse alias -> groupes de restrictions."""
+	index = {}
+	for key, values in equivalences.items():
+		aliases = [key, *values]
+		for alias in aliases:
+			a = normalize_text(alias)
+			if not a:
+				continue
+			index.setdefault(a, set()).add(key)
+	return index
+
+
+RESTRICTION_ALIAS_INDEX = build_restriction_alias_index(RESTRICTION_EQUIVALENCES)
+
+
+def register_new_restrictions(restrictions, path):
+	"""Ajoute automatiquement les nouvelles restrictions inconnues dans le JSON."""
+	global RESTRICTION_EQUIVALENCES, RESTRICTION_ALIAS_INDEX
+
+	changed = False
+	for raw in restrictions:
+		key = normalize_text(raw)
+		if not key:
+			continue
+		# Si deja connu comme cle ou alias, on ne duplique pas.
+		if key in RESTRICTION_EQUIVALENCES or key in RESTRICTION_ALIAS_INDEX:
+			continue
+		RESTRICTION_EQUIVALENCES[key] = [key]
+		changed = True
+
+	if not changed:
+		return
+
+	# Recharge l'index en memoire pour usage immediat pendant ce run.
+	RESTRICTION_ALIAS_INDEX = build_restriction_alias_index(RESTRICTION_EQUIVALENCES)
+
+	# Persistance best-effort: si echec disque, on garde quand meme l'etat en memoire.
+	try:
+		with open(path, "w", encoding="utf-8") as f:
+			json.dump(RESTRICTION_EQUIVALENCES, f, ensure_ascii=False, indent=2)
+	except Exception:
+		pass
+
+
+def build_restriction_terms(restrictions, ingredient_names):
+	"""Genere automatiquement les termes interdits (FR/EN + derives ingredients)."""
+	terms = []
+	seen = set()
+	ingredients_norm = [normalize_text(x) for x in ingredient_names]
+
+	def add_term(term):
+		t = normalize_text(term)
+		if t and t not in seen:
+			seen.add(t)
+			terms.append(t)
+
+	for raw in restrictions:
+		base = normalize_text(raw)
+		if not base:
+			continue
+
+		# Restriction utilisateur brute.
+		add_term(base)
+
+		# Cas 1: correspondance directe par cle.
+		if base in RESTRICTION_EQUIVALENCES:
+			add_term(base)
+			for value in RESTRICTION_EQUIVALENCES[base]:
+				add_term(value)
+
+		# Cas 2: alias connu (ex: bread => groupe pain).
+		for group_key in RESTRICTION_ALIAS_INDEX.get(base, set()):
+			add_term(group_key)
+			for value in RESTRICTION_EQUIVALENCES.get(group_key, []):
+				add_term(value)
+
+		# Cas 3: derivation auto depuis la base ingredients.
+		for ing in ingredients_norm:
+			if base in ing:
+				add_term(ing)
+
+		for token in base.split():
+			if len(token) < 4:
+				continue
+			for ing in ingredients_norm:
+				if token in ing:
+					add_term(ing)
+
+	return terms
+
+
+def find_forbidden_ingredients(plan_obj, restriction_terms):
+	"""Retourne les ingredients detectes qui violent les restrictions."""
+	if not isinstance(plan_obj, dict):
+		return []
+
+	violations = []
+	plan_repas = plan_obj.get("plan_repas", [])
+	for jour in plan_repas:
+		for repas in jour.get("repas", []):
+			for ingredient in repas.get("ingredients_principaux", []):
+				ing = normalize_text(ingredient)
+				for term in restriction_terms:
+					if term and term in ing:
+						violations.append(ingredient)
+						break
+
+	# Verifie aussi la liste de courses pour eviter des incoherences plan vs courses.
+	for item in plan_obj.get("liste_courses", []):
+		ingredient = item.get("ingredient", "") if isinstance(item, dict) else ""
+		ing = normalize_text(ingredient)
+		for term in restriction_terms:
+			if term and term in ing:
+				violations.append(ingredient)
+				break
+
+	# Dedoublonnage en conservant l'ordre.
+	seen = set()
+	return [x for x in violations if not (normalize_text(x) in seen or seen.add(normalize_text(x)))]
+
+
+def filter_ingredients_by_restrictions(ingredients, restriction_terms):
+	"""Retire de la base autorisee les ingredients qui matchent une restriction."""
+	filtered = []
+	for item in ingredients:
+		nom = item.get("nom", "")
+		norm_nom = normalize_text(nom)
+		blocked = any(term and term in norm_nom for term in restriction_terms)
+		if not blocked:
+			filtered.append(item)
+	return filtered
+
+
+def parse_requested_meal_types(data, repas_par_jour):
+	"""Retourne les types de repas demandes, valides et sans doublons."""
+	repas_types_raw = data.get("repas_types")
+	if repas_types_raw is None:
+		if repas_par_jour > len(ALLOWED_MEAL_TYPES):
+			raise ValueError("repas_par_jour trop eleve: maximum 3")
+		return ALLOWED_MEAL_TYPES[:repas_par_jour]
+
+	if not isinstance(repas_types_raw, list):
+		raise ValueError("repas_types doit etre une liste")
+
+	repas_types = []
+	seen = set()
+	for item in repas_types_raw:
+		t = normalize_text(item)
+		if t not in ALLOWED_MEAL_TYPES:
+			raise ValueError("repas_types contient une valeur invalide")
+		if t in seen:
+			continue
+		seen.add(t)
+		repas_types.append(t)
+
+	if len(repas_types) != repas_par_jour:
+		raise ValueError("repas_par_jour doit correspondre au nombre de repas_types")
+
+	return repas_types
+
+
+def build_repas_json_template(repas_types):
+	"""Construit un exemple JSON de repas aligne sur les types demandes."""
+	repas_template = []
+	for meal_type in repas_types:
+		repas_template.append(
+			{
+				"type": meal_type,
+				"plat": "Nom du plat",
+				"ingredients_principaux": ["ingredient"],
+				"calories_estimees": 0,
+				"temps_preparation_min": 0,
+			}
+		)
+	return json.dumps(repas_template, ensure_ascii=False, indent=4)
 
 
 def normaliser_budget(budget_brut):
@@ -289,19 +516,20 @@ def extract_json(text):
 	return {"error": "json incomplete or invalid", "raw": cleaned}
 
 
-def plan_repas_valide(obj, nb_jours, repas_par_jour):
+def plan_repas_valide(obj, repas_par_jour, expected_meal_types):
 	"""Valide la structure minimale attendue pour un plan repas complet."""
 	if not isinstance(obj, dict):
 		return False
 
-	required_keys = {"objectif_alimentaire", "nb_jours", "repas_par_jour", "plan_repas"}
+	required_keys = {"objectif_alimentaire", "repas_par_jour", "plan_repas"}
 	if not required_keys.issubset(set(obj.keys())):
 		return False
 
 	if not isinstance(obj.get("plan_repas"), list):
 		return False
 
-	if len(obj["plan_repas"]) != nb_jours:
+	# Mode fixe: un seul jour.
+	if len(obj["plan_repas"]) != 1:
 		return False
 
 	for jour in obj["plan_repas"]:
@@ -311,6 +539,10 @@ def plan_repas_valide(obj, nb_jours, repas_par_jour):
 		if not isinstance(repas, list):
 			return False
 		if len(repas) != repas_par_jour:
+			return False
+		# Mode 1 jour rapide: types de repas imposes par la requete.
+		types = [str(r.get("type", "")).strip().lower() for r in repas if isinstance(r, dict)]
+		if types != expected_meal_types:
 			return False
 
 	return True
@@ -327,9 +559,6 @@ def valider_requete(data):
 	if "objectif_alimentaire" not in data:
 		return False, "L'objectif alimentaire est obligatoire"
 
-	if "nb_jours" not in data:
-		return False, "Le nombre de jours est obligatoire"
-
 	if "repas_par_jour" not in data:
 		return False, "Le nombre de repas par jour est obligatoire"
 
@@ -338,16 +567,12 @@ def valider_requete(data):
 		return False, "Objectif alimentaire invalide"
 
 	try:
-		nb_jours = int(data["nb_jours"])
 		repas_par_jour = int(data["repas_par_jour"])
 	except (TypeError, ValueError):
-		return False, "nb_jours et repas_par_jour doivent etre numeriques"
+		return False, "repas_par_jour doit etre numerique"
 
-	if nb_jours < 1 or nb_jours > 31:
-		return False, "nb_jours doit etre compris entre 1 et 31"
-
-	if repas_par_jour < 1 or repas_par_jour > 6:
-		return False, "repas_par_jour doit etre compris entre 1 et 6"
+	if repas_par_jour < 1 or repas_par_jour > 3:
+		return False, "repas_par_jour doit etre compris entre 1 et 3"
 
 	try:
 		normaliser_budget(data.get("budget"))
@@ -360,6 +585,11 @@ def valider_requete(data):
 
 	if not isinstance(data["restrictions"], list):
 		return False, "restrictions doit etre une liste"
+
+	try:
+		parse_requested_meal_types(data, repas_par_jour)
+	except ValueError as e:
+		return False, str(e)
 
 	return True, None
 
@@ -374,45 +604,48 @@ def generer_recommandations_plats(data):
 		return {"error": erreur}
 
 	objectif_alimentaire = data["objectif_alimentaire"].lower().strip()
-	nb_jours = int(data["nb_jours"])
+	nb_jours = 1
 	repas_par_jour = int(data["repas_par_jour"])
+	repas_types = parse_requested_meal_types(data, repas_par_jour)
 	niveau_budget, budget = normaliser_budget(data.get("budget"))
 	restrictions = data.get("restrictions", [])
 
 	# Dedoublonnage simple en preservant l'ordre.
 	seen = set()
 	restrictions = [x for x in restrictions if not (str(x).strip().lower() in seen or seen.add(str(x).strip().lower()))]
+	register_new_restrictions(restrictions, RESTRICTIONS_EQ_FILE)
 	ingredients_autorises = charger_ingredients_par_budget(niveau_budget)
+	restriction_terms = build_restriction_terms(restrictions, [x.get("nom", "") for x in ingredients_autorises])
+	ingredients_autorises = filter_ingredients_by_restrictions(ingredients_autorises, restriction_terms)
+	if not ingredients_autorises:
+		return {
+			"error": "aucun_ingredient_autorise",
+			"details": "Toutes les options d'ingredients sont bloquees par les restrictions.",
+		}
 	ingredients_autorises_noms = [x["nom"] for x in ingredients_autorises]
+
+	# Ajuste les tokens au volume demande pour limiter la latence.
+	estimated_tokens = max(700, min(HF_MAX_TOKENS, nb_jours * repas_par_jour * 55 + 260))
 
 	prompt = f"""
 Tu es une IA nutritionniste. Genere un plan de repas en JSON strict.
 
 Contrainte utilisateur:
 - objectif_alimentaire: {objectif_alimentaire}
-- nb_jours: {nb_jours}
 - repas_par_jour: {repas_par_jour}
+- repas_types: {json.dumps(repas_types, ensure_ascii=False)}
 - budget: {budget}
 - restrictions: {json.dumps(restrictions, ensure_ascii=False)}
+- restrictions_normalisees_fr_en: {json.dumps(restriction_terms, ensure_ascii=False)}
 - ingredients_disponibles_budget: {json.dumps(ingredients_autorises_noms, ensure_ascii=False)}
 
 JSON STRICT:
 {{
   "objectif_alimentaire": "{objectif_alimentaire}",
-  "nb_jours": {nb_jours},
   "repas_par_jour": {repas_par_jour},
   "plan_repas": [
 	{{
-	  "jour": 1,
-	  "repas": [
-		{{
-		  "type": "repas_1",
-		  "plat": "Nom du plat",
-		  "ingredients_principaux": ["ingredient"],
-		  "calories_estimees": 0,
-		  "temps_preparation_min": 0
-		}}
-	  ]
+	  "repas": {build_repas_json_template(repas_types)}
 	}}
   ],
   "liste_courses": [
@@ -421,41 +654,61 @@ JSON STRICT:
 }}
 
 Regles strictes:
-- Respecte exactement nb_jours et repas_par_jour.
-- Evite strictement tous les aliments presentes dans restrictions.
+- Le plan porte toujours sur une seule journee.
+- Le tableau repas doit contenir exactement les types dans repas_types, dans le meme ordre.
+- Evite strictement tous les aliments presentes dans restrictions et restrictions_normalisees_fr_en.
+- Si un ingredient contient un terme interdit (ex: chicken pour poulet, rice pour riz), il est interdit.
 - N'utilise que les ingredients presents dans ingredients_disponibles_budget.
 - Aucun texte hors JSON.
 """.strip()
 
 	response = call_hf_model(
 		prompt,
-		max_new_tokens=HF_MAX_TOKENS,
+		max_new_tokens=estimated_tokens,
 		temperature=0.2,
 		top_p=0.9,
 		repetition_penalty=1.1,
 	)
 
 	parsed = extract_json(response)
-	plan_ok = plan_repas_valide(parsed, nb_jours, repas_par_jour)
+	plan_ok = plan_repas_valide(parsed, repas_par_jour, repas_types)
+	violations = find_forbidden_ingredients(parsed, restriction_terms)
 
-	if parsed.get("error") in {"no json found", "invalid json", "json incomplete or invalid"} or not plan_ok:
-		retry_tokens = max(HF_MAX_TOKENS + 400, int(HF_MAX_TOKENS * 1.6))
+	if parsed.get("error") in {"no json found", "invalid json", "json incomplete or invalid"} or not plan_ok or violations:
+		retry_tokens = max(estimated_tokens + 220, int(estimated_tokens * 1.25))
+		violations_hint = ""
+		if violations:
+			violations_hint = f"\nCorrection obligatoire: retire ces ingredients interdits detectes: {json.dumps(violations, ensure_ascii=False)}"
 		response = call_hf_model(
-			prompt + "\nRappel final: renvoie uniquement l'objet JSON ci-dessus, sans details supplementaires.",
+			prompt + "\nRappel final: renvoie uniquement l'objet JSON ci-dessus, sans details supplementaires." + violations_hint,
 			max_new_tokens=retry_tokens,
 			temperature=0.1,
 			top_p=0.9,
 			repetition_penalty=1.1,
 		)
 		parsed = extract_json(response)
-		plan_ok = plan_repas_valide(parsed, nb_jours, repas_par_jour)
+		plan_ok = plan_repas_valide(parsed, repas_par_jour, repas_types)
+		violations = find_forbidden_ingredients(parsed, restriction_terms)
 
 	if "error" not in parsed and not plan_ok:
 		parsed = {"error": "json incomplete or invalid", "raw": response}
 
+	if "error" not in parsed and violations:
+		parsed = {
+			"error": "restrictions_non_respectees",
+			"details": "Des ingredients interdits ont ete detectes dans la sortie.",
+			"ingredients_interdits_detectes": violations,
+			"raw": response,
+		}
+
 	if "error" in parsed:
 		METRICS["errors"] += 1
 	else:
+		# Nettoie l'ancien champ si le modele le renvoie encore.
+		parsed.pop("nb_jours", None)
+		for bloc in parsed.get("plan_repas", []):
+			if isinstance(bloc, dict):
+				bloc.pop("jour", None)
 		METRICS["json_ok"] += 1
 		parsed["budget"] = {
 			"niveau": niveau_budget,
@@ -473,10 +726,10 @@ Regles strictes:
 if __name__ == "__main__":
 	requete_test = {
 		"objectif_alimentaire": "perte_de_poids",
-		"nb_jours": 7,
-		"repas_par_jour": 3,
+		"repas_par_jour": 2,
+		"repas_types": ["dejeuner", "souper"],
 		"budget": 2,
-		"restrictions": ["arachides", "porc", "poulet", "riz", "brocoli"],
+		"restrictions": ["arachides", "porc", "poulet", "riz", "brocoli", "bacon"],
 	}
 
 	resultat = generer_recommandations_plats(requete_test)
